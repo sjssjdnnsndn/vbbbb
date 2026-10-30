@@ -1,3 +1,4 @@
 aiogram>=3.7,<4
 aiohttp>=3.12,<4
 opentele-ng>=1.5,<2
+reportlab>=4,<5
