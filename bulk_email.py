@@ -49,7 +49,7 @@ def _split_email_line(line: str) -> tuple[str, str]:
             return email.strip(), url.strip()
     parts = line.split(None, 1)
     if len(parts) != 2:
-        raise BulkInputError("Email line mein address aur OTP link dono hone chahiye")
+        raise BulkInputError("邮箱行必须同时包含地址和 OTP 链接")
     return parts[0].strip(), parts[1].strip()
 
 
@@ -62,23 +62,23 @@ def parse_email_links(text: str) -> list[EmailTarget]:
         try:
             email, url = _split_email_line(line)
         except BulkInputError as exc:
-            raise BulkInputError(f"Email file line {line_number}: {exc}") from None
+            raise BulkInputError(f"邮箱文件第 {line_number} 行：{exc}") from None
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-            raise BulkInputError(f"Email file line {line_number}: email invalid hai")
+            raise BulkInputError(f"邮箱文件第 {line_number} 行：邮箱无效")
         try:
             parsed = urlsplit(url)
         except ValueError:
-            raise BulkInputError(f"Email file line {line_number}: OTP link invalid hai") from None
+            raise BulkInputError(f"邮箱文件第 {line_number} 行：OTP 链接无效") from None
         if (
             parsed.scheme.lower() not in {"http", "https"}
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
         ):
-            raise BulkInputError(f"Email file line {line_number}: OTP link invalid hai")
+            raise BulkInputError(f"邮箱文件第 {line_number} 行：OTP 链接无效")
         targets.append(EmailTarget(email=email, inbox_url=url))
     if not targets:
-        raise BulkInputError("Email file mein koi valid email+OTP link nahi mila")
+        raise BulkInputError("邮箱文件中未找到有效的邮箱+OTP 链接")
     return targets
 
 
@@ -162,9 +162,9 @@ def _validate_hostname(host: str, port: int) -> None:
             infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
             addresses = [ipaddress.ip_address(info[4][0]) for info in infos]
         except (OSError, ValueError, IndexError):
-            raise OtpLinkError("Inbox host resolve nahi hua") from None
+            raise OtpLinkError("无法解析收件箱主机") from None
     if not addresses or any(not address.is_global for address in addresses):
-        raise OtpLinkError("Private/local inbox host allowed nahi hai")
+        raise OtpLinkError("不允许私有/本地收件箱主机")
 
 
 async def validate_inbox_url(url: str) -> None:
@@ -175,7 +175,7 @@ async def validate_inbox_url(url: str) -> None:
         or parsed.username is not None
         or parsed.password is not None
     ):
-        raise OtpLinkError("Inbox URL invalid hai")
+        raise OtpLinkError("收件箱 URL 无效")
     port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     await asyncio.to_thread(_validate_hostname, parsed.hostname, port)
 
@@ -195,22 +195,22 @@ async def fetch_inbox_text(session: aiohttp.ClientSession, url: str) -> str:
                 if response.status in {301, 302, 303, 307, 308}:
                     location = response.headers.get("Location")
                     if not location:
-                        raise OtpLinkError("Inbox redirect invalid hai")
+                        raise OtpLinkError("收件箱重定向无效")
                     current_url = urljoin(current_url, location)
                     continue
                 if response.status != 200:
-                    raise OtpLinkError(f"Inbox HTTP status {response.status}")
+                    raise OtpLinkError(f"收件箱 HTTP 状态 {response.status}")
                 content = await response.content.read(MAX_INBOX_BYTES + 1)
                 if len(content) > MAX_INBOX_BYTES:
-                    raise OtpLinkError("Inbox response size limit se zyada hai")
+                    raise OtpLinkError("收件箱响应超过大小限制")
                 encoding = response.charset or "utf-8"
                 try:
                     return content.decode(encoding, errors="replace")
                 except LookupError:
                     return content.decode("utf-8", errors="replace")
-        raise OtpLinkError("Inbox redirect limit cross ho gayi")
+        raise OtpLinkError("收件箱重定向次数超过限制")
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        raise OtpLinkError("Inbox fetch failed") from None
+        raise OtpLinkError("收件箱获取失败") from None
 
 
 async def read_otp_baseline(session: aiohttp.ClientSession, url: str) -> set[str]:
@@ -229,7 +229,7 @@ async def wait_for_new_otp(
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            raise OtpTimeoutError("OTP 120 seconds ke andar nahi mila")
+            raise OtpTimeoutError("120 秒内未收到 OTP")
         try:
             raw = await asyncio.wait_for(
                 fetch_inbox_text(session, url), timeout=min(15, remaining)
@@ -243,5 +243,5 @@ async def wait_for_new_otp(
             pass
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            raise OtpTimeoutError("OTP 120 seconds ke andar nahi mila")
+            raise OtpTimeoutError("120 秒内未收到 OTP")
         await asyncio.sleep(min(OTP_POLL_SECONDS, remaining))
