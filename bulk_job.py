@@ -41,6 +41,24 @@ def _cleanup_session(item: BulkItem) -> None:
     item.session_path.with_suffix(".session-journal").unlink(missing_ok=True)
 
 
+STATUS_LABELS_ZH = {
+    "uploaded": "已上传",
+    "converted": "已转换",
+    "conversion_failed": "转换失败",
+    "check_failed": "检查失败",
+    "duplicate": "重复",
+    "already_set": "已设置",
+    "pending": "待处理",
+    "success": "成功",
+    "email_failed": "邮箱更改失败",
+    "otp_timeout": "OTP 超时",
+}
+
+
+def _status_label(status: str) -> str:
+    return STATUS_LABELS_ZH.get(status, status)
+
+
 async def _notify_batch(batch: list[BulkItem], batch_number: int, notify) -> None:
     success = sum(item.status == "success" for item in batch)
     failed = len(batch) - success
@@ -48,18 +66,18 @@ async def _notify_batch(batch: list[BulkItem], batch_number: int, notify) -> Non
     last = batch[-1].index
     if failed == 0:
         await notify(
-            f"Batch {batch_number} ({first}-{last}): sabhi {success} accounts ka "
-            "bound mail change successful."
+            f"第 {batch_number} 批（{first}-{last}）：{success} 个账号的"
+            "绑定邮箱均已成功更改。"
         )
         return
-    failed_labels = ", ".join(
-        f"Account {item.index} ({item.status})"
+    failed_labels = "，".join(
+        f"账号 {item.index}（{_status_label(item.status)}）"
         for item in batch
         if item.status != "success"
     )
     await notify(
-        f"Batch {batch_number} ({first}-{last}): success={success}, failed={failed}.\n"
-        f"Failed: {failed_labels}"
+        f"第 {batch_number} 批（{first}-{last}）：成功={success}，失败={failed}。\n"
+        f"失败：{failed_labels}"
     )
 
 
@@ -73,7 +91,7 @@ async def run_bulk_job(
 ) -> dict[str, int]:
     """Run conversion, status checks, then authorized email changes in sequence."""
     total = len(items)
-    await notify(f"Bulk process started: {total} items. Conversion sequence start ho rahi hai.")
+    await notify(f"批量处理已开始：共 {total} 项。开始按顺序转换。")
 
     for item in items:
         try:
@@ -91,8 +109,8 @@ async def run_bulk_job(
     converted = [item for item in items if item.status == "converted"]
     conversion_failed = total - len(converted)
     await notify(
-        f"Conversion complete: success={len(converted)}, failed={conversion_failed}. "
-        "Ab bound-mail checking sequence start ho rahi hai."
+        f"转换完成：成功={len(converted)}，失败={conversion_failed}。"
+        "现在开始按顺序检查绑定邮箱。"
     )
 
     seen_user_ids: set[int] = set()
@@ -125,13 +143,13 @@ async def run_bulk_job(
     duplicates = sum(item.status == "duplicate" for item in items)
     check_failed = sum(item.status == "check_failed" for item in items)
     await notify(
-        "Checking complete: "
-        f"bound mail already set={already_set}, set nahi={len(pending)}, "
-        f"duplicates={duplicates}, check failed={check_failed}."
+        "检查完成："
+        f"已设置绑定邮箱={already_set}，未设置={len(pending)}，"
+        f"重复={duplicates}，检查失败={check_failed}。"
     )
 
     if not pending:
-        await notify("Kisi account ka bound mail change pending nahi hai. Bulk process complete.")
+        await notify("没有账号需要更改绑定邮箱。批量处理完成。")
         return {
             "total": total,
             "converted": len(converted),
@@ -143,8 +161,8 @@ async def run_bulk_job(
         }
 
     await notify(
-        f"{len(pending)} accounts ka bound mail change sequential hoga. "
-        "Har account ke beech random 3-5 minute gap aur OTP wait max 2 minutes hai."
+        f"{len(pending)} 个账号将按顺序更改绑定邮箱。"
+        "每个账号之间随机等待 3–5 分钟，OTP 最长等待 2 分钟。"
     )
 
     async with aiohttp.ClientSession() as http_session:
@@ -162,7 +180,7 @@ async def run_bulk_job(
                 client = client_factory(str(item.session_path))
                 await client.connect()
                 if not await client.is_user_authorized():
-                    raise RuntimeError("Session unauthorized")
+                    raise RuntimeError("会话未授权")
 
                 sent = await client(
                     functions.account.SendVerifyEmailCodeRequest(
@@ -218,10 +236,10 @@ async def run_bulk_job(
     success = sum(item.status == "success" for item in pending)
     failed = len(pending) - success
     await notify(
-        "Bulk process complete: "
-        f"email success={success}, email failed/timeout={failed}, "
-        f"already set={already_set}, conversion failed={conversion_failed}, "
-        f"check failed={check_failed}, duplicates={duplicates}."
+        "批量处理完成："
+        f"邮箱更改成功={success}，邮箱更改失败/超时={failed}，"
+        f"已设置={already_set}，转换失败={conversion_failed}，"
+        f"检查失败={check_failed}，重复={duplicates}。"
     )
     return {
         "total": total,
