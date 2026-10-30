@@ -19,7 +19,7 @@ def normalize_phone_number(phone_number: str) -> str:
     normalized = re.sub(r"[\s().-]", "", phone_number.strip())
     if not re.fullmatch(r"\+[1-9]\d{6,14}", normalized):
         raise ValueError(
-            "Use the new phone number in international format, for example +919876543210"
+            "请使用国际格式的新手机号码，例如 +919876543210"
         )
     return normalized[1:]
 
@@ -28,17 +28,17 @@ def require_standard_sent_code(response) -> types.auth.SentCode:
     """Reject responses that need a flow this headless client cannot truthfully handle."""
     if isinstance(response, types.auth.SentCodePaymentRequired):
         raise ValueError(
-            "Telegram requested a paid verification flow; no payment or phone change was attempted"
+            "Telegram 要求付费验证流程；未尝试付款或更改手机号码"
         )
     if not isinstance(response, types.auth.SentCode):
         raise ValueError(
-            "Telegram did not return a standard verification-code response "
+            "Telegram 未返回标准验证码响应"
             f"({type(response).__name__})"
         )
     if isinstance(response.type, types.auth.SentCodeTypeFirebaseSms):
         raise ValueError(
-            "Telegram selected Firebase SMS, which requires official Android "
-            "attestation; this headless flow cannot handle it"
+            "Telegram 选择了 Firebase 短信，这需要官方 Android "
+            "证明；此无界面流程无法处理"
         )
     return response
 
@@ -100,7 +100,7 @@ async def check_session(session_path: Path) -> dict:
     It never returns or prints the actual email pattern.
     """
     if not session_path.is_file():
-        raise FileNotFoundError(f"Telethon session file not found: {session_path}")
+        raise FileNotFoundError(f"未找到 Telethon 会话文件：{session_path}")
 
     client = TelegramClient(str(session_path), api=API.TelegramDesktop)
     try:
@@ -149,7 +149,7 @@ async def change_login_email(session_path: Path, new_email: str) -> None:
             "code can be entered securely."
         )
     if not session_path.is_file():
-        raise SystemExit(f"Telethon session file not found: {session_path}")
+        raise SystemExit(f"未找到 Telethon 会话文件：{session_path}")
 
     new_email = new_email.strip()
     local_part, separator, domain = new_email.partition("@")
@@ -215,7 +215,7 @@ async def change_phone_number(
             "code can be entered securely."
         )
     if not session_path.is_file():
-        raise SystemExit(f"Telethon session file not found: {session_path}")
+        raise SystemExit(f"未找到 Telethon 会话文件：{session_path}")
 
     try:
         request_phone = normalize_phone_number(new_phone_number)
